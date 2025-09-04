@@ -39,7 +39,7 @@ async def parse_page(html):
             continue
 
         p_tags = right_div.find_all("p")
-        if len(p_tags) > 2:   # rule: chỉ lấy nếu có đúng 2 thẻ p
+        if len(p_tags) > 2: 
             continue
 
         # --- valid_date ---
@@ -122,18 +122,17 @@ async def extract_source_url(session, detail_url: str) -> str | None:
             for c in candidates:
                 if c.lower().endswith(".docx"):
                     return BASE_URL + c
-
     return None
 
 
 async def crawl_all(url):
     async with aiohttp.ClientSession() as session:
+        start_time = time.time()
         # Lấy số page
         first_html = await fetch(session, url)
         soup = BeautifulSoup(first_html, "html.parser")
         last_page_tag = soup.find("a", string=lambda t: t and "Cuối" in t)
         total_page = int(last_page_tag["href"].split("Page=")[-1])
-        total_page = min(total_page, 2)  # test giới hạn 20 page
         print(f"Tổng số page: {total_page}")
 
         # B1: tải tất cả page song song
@@ -145,7 +144,6 @@ async def crawl_all(url):
         parse_tasks = [parse_page(html) for html in pages_html]
         parsed_pages = await asyncio.gather(*parse_tasks)
         items = [item for page in parsed_pages for item in page]  # flatten
-        print("-------------Xong bước 2")
 
         # B3: extract source_url song song
         semaphore = asyncio.Semaphore(10)
@@ -158,13 +156,26 @@ async def crawl_all(url):
         for item, src in zip(items, source_urls):
             if src:
                 enriched_items.append({**item, "source_url": src})
-        print("------------enriched_items", enriched_items)
+
+        # Biến src thành upload_url
+        upload_url_tasks = [
+            upload_pdf_from_url(item["source_url"])
+            for item in enriched_items
+        ]
+        upload_urls = await asyncio.gather(*upload_url_tasks)
+        for item, upload_url in zip(enriched_items, upload_urls):
+            item["source_url"] = upload_url
 
         # B4: OCR song song
         ocr_results = await run_ocr_for_items(enriched_items)
-        print("------------ocr_results", ocr_results)
-        final_results = []
-        return final_results
+        print(f"OCR done in {time.time() - start_time:.2f} seconds")
+
+        # B5: Ghép kết quả OCR vào field content
+        for item, ocr_result in zip(enriched_items, ocr_results):
+            item["content"] = ocr_result["content"]
+            item.pop("detail_url", None)
+
+        return enriched_items
 
 
 import os
@@ -176,61 +187,54 @@ load_dotenv()
 api_key = "joqMh4RpBz5YVBiPOTHPlbCPvt3ZDylA"
 client = Mistral(api_key=api_key)
 
-import requests
 import tempfile
 
-def download_file(url: str) -> str:
-    response = requests.get(url, stream=True)
-    response.raise_for_status()
 
-    # Lấy tên file từ URL hoặc dùng tên tạm
-    filename = url.split("/")[-1] or "downloaded.pdf"
+async def download_file(url: str) -> str:
+    async with aiohttp.ClientSession() as session:
+        async with session.get(url) as response:
+            response.raise_for_status()
+            filename = url.split("/")[-1] or "downloaded.pdf"
 
-    # Lưu trong thư mục tạm
-    temp_dir = tempfile.gettempdir()
-    file_path = os.path.join(temp_dir, filename)
+            # Lưu trong thư mục tạm
+            temp_dir = tempfile.gettempdir()
+            file_path = os.path.join(temp_dir, filename)
 
-    with open(file_path, "wb") as f:
-        for chunk in response.iter_content(chunk_size=8192):
-            f.write(chunk)
+            with open(file_path, "wb") as f:
+                async for chunk in response.content.iter_chunked(8192):
+                    f.write(chunk)
 
-    return file_path
+            return file_path
 
-def upload_pdf(file_path):
-    with open(file_path, "rb") as f:
-        content = f.read()
-        filename = os.path.basename(file_path)
-        uploaded_file = client.files.upload(
-            file={"file_name": filename, "content": content},
-            purpose="ocr",
-        )
-        signed_url = client.files.get_signed_url(file_id=uploaded_file.id)
-        return signed_url.url
+
+async def upload_pdf(file_path: str) -> str:
+    def _sync_upload():
+        with open(file_path, "rb") as f:
+            content = f.read()
+            filename = os.path.basename(file_path)
+            uploaded_file = client.files.upload(
+                file={"file_name": filename, "content": content},
+                purpose="ocr",
+            )
+            signed_url = client.files.get_signed_url(file_id=uploaded_file.id)
+            return signed_url.url
+    return await asyncio.to_thread(_sync_upload)
     
-def upload_pdf_from_url(url: str):
-    local_path = download_file(url)
-    return upload_pdf(local_path)
+async def upload_pdf_from_url(url: str) -> str:
+    local_path = await download_file(url)
+    return await upload_pdf(local_path)
 
-def process_ocr(document_source):
-    ocr_result = client.ocr.process(
+
+async def process_ocr(document_source):
+    ocr_result = await client.ocr.process_async(
         model="mistral-ocr-latest",
         document=document_source,
         include_image_base64=True
     )
-    markdown_text = concat_ocr_markdown(ocr_result)
     return {
-        "markdown": markdown_text,
+        "ocr_result": ocr_result.pages,
         "document_source": document_source
     }
-
-def concat_ocr_markdown(ocr_response) -> str:
-    all_pages = []
-    for page in ocr_response.pages:
-        # page là OCRPageObject
-        md = getattr(page, "markdown", "")
-        all_pages.append(md.strip())
-
-    return "\n\n".join(all_pages)
 
 
 async def run_ocr_for_items(items):
@@ -238,8 +242,8 @@ async def run_ocr_for_items(items):
     async def ocr_task(item):
         async with semaphore:
             document_source = {"type": "document_url", "document_url": item["source_url"]}
-            ocr = await asyncio.to_thread(process_ocr, document_source)
-            return {**item, "ocr_markdown": ocr["markdown"]}
+            ocr = await process_ocr(document_source)
+            return {**item, "content": ocr["ocr_result"]}
 
     tasks = [ocr_task(item) for item in items]
     results = await asyncio.gather(*tasks)
@@ -250,4 +254,4 @@ if __name__ == "__main__":
     url = "https://vbpl.vn/TW/Pages/vanban.aspx?idLoaiVanBan=20&dvid=13&Page=1"
     data = asyncio.run(crawl_all(url))
     print(f"Tổng số văn bản thỏa mãn: {len(data)}")
-    print(data[:10])
+    print(data[:2])
