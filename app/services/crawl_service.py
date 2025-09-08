@@ -1,18 +1,21 @@
 import asyncio
-import aiohttp
-from bs4 import BeautifulSoup
-from datetime import datetime
-import time
-import re
 import os
+import re
 import tempfile
+import time
+from datetime import datetime
 from urllib.parse import urljoin
 
-from app.services.ocr_service import OCRService
+import aiohttp
+from bs4 import BeautifulSoup
+
 from app.config.logging import log
+from app.services.ocr_service import OCRService
 
 BASE_URL = os.getenv("BASE_URL", "https://vbpl.vn")
-DATE_THRESHOLD = datetime.strptime(os.getenv("DATE_THRESHOLD", "01/07/2025"), "%d/%m/%Y")
+DATE_THRESHOLD = datetime.strptime(
+    os.getenv("DATE_THRESHOLD", "01/07/2025"), "%d/%m/%Y"
+)
 
 
 class CrawlService:
@@ -39,13 +42,18 @@ class CrawlService:
                     async for chunk in response.content.iter_chunked(8192):
                         f.write(chunk)
                 return file_path
-            
 
     async def crawl_all(self) -> list[dict]:
         async with aiohttp.ClientSession() as session:
             try:
                 start_time = time.time()
-                start_url = os.getenv("START_URL", "https://vbpl.vn/TW/Pages/vanban.aspx?idLoaiVanBan=20&dvid=13&Page=1")
+                start_url = os.getenv(
+                    "START_URL",
+                    (
+                        "https://vbpl.vn/TW/Pages/vanban.aspx?"
+                        "idLoaiVanBan=20&dvid=13&Page=1"
+                    ),
+                )
                 # Lấy số page
                 first_html = await self.fetch(session, start_url)
                 soup = BeautifulSoup(first_html, "html.parser")
@@ -59,11 +67,14 @@ class CrawlService:
                 # B1: tải tất cả page song song
                 page_tasks = []
                 for page in range(1, total_page + 1):
-                    page_url = f"https://vbpl.vn/TW/Pages/vanban.aspx?idLoaiVanBan=20&dvid=13&Page={page}"
+                    page_url = (
+                        f"https://vbpl.vn/TW/Pages/vanban.aspx?"
+                        f"idLoaiVanBan=20&dvid=13&Page={page}"
+                    )
                     # print(f"Fetching page: {page_url}")
                     page_tasks.append(self.fetch(session, page_url))
                 pages_html = await asyncio.gather(*page_tasks)
-                
+
                 # B2: parse tất cả page song song
                 parse_tasks = [self.parse_page(html) for html in pages_html]
                 parsed_pages = await asyncio.gather(*parse_tasks)
@@ -77,14 +88,15 @@ class CrawlService:
                     items = items[:max_doc]
 
                 src_tasks = [
-                    self.extract_source_url(session, item["file_url"])
-                    for item in items
+                    self.extract_source_url(session, item["file_url"]) for item in items
                 ]
                 source_urls = await asyncio.gather(*src_tasks)
                 enriched_items = []
                 for item, src in zip(items, source_urls):
                     if src:
-                        enriched_items.append({**item, "source_url": src, "view_url": src})
+                        enriched_items.append(
+                            {**item, "source_url": src, "view_url": src}
+                        )
                 print(f"Extract done in {time.time() - start_time:.2f} seconds")
 
                 # B4: Upload file lên mistral cloud
@@ -111,7 +123,7 @@ class CrawlService:
                 print(f"Total time: {time.time() - start_time:.2f} seconds")
 
                 return enriched_items
-            
+
             except Exception as e:
                 log.error(f"Crawl website {os.getenv('START_URL')} error: {e}")
                 return []
@@ -140,7 +152,7 @@ class CrawlService:
                 continue
 
             p_tags = right_div.find_all("p")
-            if len(p_tags) > 2: 
+            if len(p_tags) > 2:
                 continue
 
             # --- valid_date ---
@@ -148,7 +160,11 @@ class CrawlService:
             for p in p_tags:
                 label = p.find("label")
                 if label and "Hiệu lực" in label.get_text(strip=True):
-                    valid_date_text = p.get_text(strip=True).replace(label.get_text(strip=True), "").strip()
+                    valid_date_text = (
+                        p.get_text(strip=True)
+                        .replace(label.get_text(strip=True), "")
+                        .strip()
+                    )
                     break
             if not valid_date_text:
                 continue
@@ -165,13 +181,17 @@ class CrawlService:
             first_p = p_tags[0]
             label = first_p.find("label")
             if label:
-                public_date_text = first_p.get_text(strip=True).replace(label.get_text(strip=True), "").strip()
+                public_date_text = (
+                    first_p.get_text(strip=True)
+                    .replace(label.get_text(strip=True), "")
+                    .strip()
+                )
             else:
                 public_date_text = first_p.get_text(strip=True)
 
             # --- file_path (title) ---
-            title_tag = title_div.find("a") 
-            if not title_tag: 
+            title_tag = title_div.find("a")
+            if not title_tag:
                 continue
 
             # --- file_url ---
@@ -180,16 +200,17 @@ class CrawlService:
                 continue
             file_url = BASE_URL + detail_a["href"]
 
-            items.append({
-                "title": title_tag.get_text(strip=True),
-                "content": [],
-                "valid_date": valid_date.strftime("%d/%m/%Y"),
-                "public_date": public_date_text,
-                "file_url": file_url
-            })
+            items.append(
+                {
+                    "title": title_tag.get_text(strip=True),
+                    "content": [],
+                    "valid_date": valid_date.strftime("%d/%m/%Y"),
+                    "public_date": public_date_text,
+                    "file_url": file_url,
+                }
+            )
 
         return items
-
 
     async def extract_source_url(self, session, file_url: str) -> str | None:
         async with self.semaphore:
@@ -231,7 +252,13 @@ class CrawlService:
 
 class CrawlerServiceV2:
     def __init__(self, ocr_service):
-        self.base_url = os.getenv("BASE_URL_V2", "https://vanban.chinhphu.vn/he-thong-van-ban?classid=1&mode=1&typegroupid=4")
+        self.base_url = os.getenv(
+            "BASE_URL_V2",
+            (
+                "https://vanban.chinhphu.vn/he-thong-van-ban?"
+                "classid=1&mode=1&typegroupid=4"
+            ),
+        )
         self.session: aiohttp.ClientSession | None = None
         self.ocr_service = ocr_service
 
@@ -265,8 +292,9 @@ class CrawlerServiceV2:
                     links.append(a_tag["href"])
             return links
         except Exception as e:
+            log.error(f"Extract attachment links error: {e}")
             return []
-    
+
     async def _extract_attachment_links(self, html: str) -> list[str]:
         try:
             if not self.session:
@@ -332,24 +360,35 @@ class CrawlerServiceV2:
                     continue
 
                 if eff_date >= datetime(2025, 7, 1):
-                    attach_val, attach_td = details.get("Tài liệu đính kèm", (None, None))
+                    attach_val, attach_td = details.get(
+                        "Tài liệu đính kèm", (None, None)
+                    )
                     if attach_td:
                         a = attach_td.find("a", title="Tải về", href=True)
                         if a:
                             file_url = urljoin(self.base_url, a["href"])
-                            results.append({
-                                "title": details.get("Số ký hiệu", (None, None))[0],
-                                "source_url": file_url,
-                                "view_url": file_url,
-                                "valid_date": eff_date_str,
-                                "public_date": details.get("Ngày ban hành", (None, None))[0],
-                                "abstract": details.get("Trích yếu", (None, None))[0],
-                            })
+                            results.append(
+                                {
+                                    "title": details.get("Số ký hiệu", (None, None))[0],
+                                    "source_url": file_url,
+                                    "view_url": file_url,
+                                    "valid_date": eff_date_str,
+                                    "public_date": details.get(
+                                        "Ngày ban hành", (None, None)
+                                    )[0],
+                                    "abstract": details.get("Trích yếu", (None, None))[
+                                        0
+                                    ],
+                                }
+                            )
             return results
         except Exception as e:
+            log.error(f"Extract attachment links error: {e}")
             return []
 
-    async def fetch_page(self, page_number: int, hidden_fields: dict | None = None) -> str:
+    async def fetch_page(
+        self, page_number: int, hidden_fields: dict | None = None
+    ) -> str:
         try:
             if not self.session:
                 raise RuntimeError("Session chưa được khởi tạo.")
@@ -390,15 +429,15 @@ class CrawlerServiceV2:
             print(f"B1 done in {time.time() - start_time:.2f} seconds")
 
             # B2: Upload pdf
-            upload_url_tasks = [
-                self.ocr_service.upload_pdf_from_url(item["source_url"])
-                for item in items[:2]
-            ]
-            upload_urls = await asyncio.gather(*upload_url_tasks)
-            for item, upload_url in zip(items, upload_urls):
-                item["source_url"] = upload_url
-            print(f"B2 done in {time.time() - start_time:.2f} seconds")
-            print("---------------------items", items[0])
+            # upload_url_tasks = [
+            #     self.ocr_service.upload_pdf_from_url(item["source_url"])
+            #     for item in items[:2]
+            # ]
+            # upload_urls = await asyncio.gather(*upload_url_tasks)
+            # for item, upload_url in zip(items, upload_urls):
+            #     item["source_url"] = upload_url
+            # print(f"B2 done in {time.time() - start_time:.2f} seconds")
+
             # B3: OCR
             ocr_results = []
             ocr_results = await self.ocr_service.run_ocr_for_items(items)
@@ -411,6 +450,7 @@ class CrawlerServiceV2:
             print(f"B3 done in {time.time() - start_time:.2f} seconds")
 
             return items
-        
+
         except Exception as e:
+            log.error(f"Crawl all error: {e}")
             return []
